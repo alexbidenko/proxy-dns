@@ -1,0 +1,26 @@
+version: "3.8"
+
+services:
+  application:
+    image: ghcr.io/alexbidenko/proxy-dns/dns-application:latest
+    expose:
+      - 53
+      - 443
+      - 853
+    ports:
+      - "53:53/tcp"
+      - "53:53/udp"
+      - "443:443/tcp"
+      - "443:443/udp"
+      - "853:853/tcp"
+      - "853:853/udp"
+    environment:
+      PROXY_SERVER_ADDRESS: ${PROXY_SERVER_ADDRESS}
+      LOCATION_SERVER_ORIGIN: ${LOCATION_SERVER_ORIGIN}
+    deploy:
+      replicas: 1
+      update_config:
+        failure_action: rollback
+        order: start-first
+      restart_policy:
+        condition: on-failure
