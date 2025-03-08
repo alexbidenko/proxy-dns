@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  application:
+    image: ghcr.io/alexbidenko/proxy-dns/proxy-application:latest
+    expose:
+      - 80
+      - 443
+    ports:
+      - "80:80/tcp"
+      - "80:80/udp"
+      - "443:443/tcp"
+      - "443:443/udp"
+    deploy:
+      replicas: 1
+      update_config:
+        failure_action: rollback
+        order: start-first
+      restart_policy:
+        condition: on-failure
