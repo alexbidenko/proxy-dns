@@ -120,6 +120,7 @@ var plugins = []DNSPlugin{
 	&RegexProxyPlugin{Regexes: []*regexp.Regexp{
 		regexp.MustCompile(`(?i)^(.+\.)?google\.com$`),
 		regexp.MustCompile(`(?i)^(.+\.)?youtube\.com$`),
+		regexp.MustCompile(`(?i)^(.+\.)?googlevideo\.com$`),
 	}},
 }
 
