@@ -116,7 +116,7 @@ var proxyIPStrV6 = os.Getenv("PROXY_SERVER_ADDRESS_IPV6")
 // plugins – список плагинов, обрабатывающих запросы последовательно.
 // Сначала вызывается PiHoleQueryPlugin, затем RegexProxyPlugin.
 var plugins = []DNSPlugin{
-	&PiHoleQueryPlugin{piholeAddr: "pihole"},
+	&PiHoleQueryPlugin{piholeAddr: os.Getenv("PIHOLE_ADDRESS")},
 	&RegexProxyPlugin{Regexes: []*regexp.Regexp{
 		regexp.MustCompile(`(?i)^(.+\.)?google\.com$`),
 		regexp.MustCompile(`(?i)^(.+\.)?youtube\.com$`),
