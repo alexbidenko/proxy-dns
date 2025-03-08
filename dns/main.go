@@ -4,12 +4,14 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -18,39 +20,88 @@ import (
 
 // DNSPlugin определяет интерфейс плагина для обработки запросов.
 type DNSPlugin interface {
+	// Если возвращается blocked==true, то дальнейшая обработка прекращается, и в ответ сразу возвращается указанный ip.
 	HandleQuery(domain string, qtype uint16) (blocked bool, ip net.IP)
 }
 
-// PiHolePlugin – пример плагина, блокирующего домены (аналог Pi-hole).
-type PiHolePlugin struct {
-	blockedDomains []string
+// ------------------ PiHole Query Plugin ------------------
+
+// PiHoleQueryPlugin выполняет DNS-запрос к Pi-hole-серверу и, если ответа нет или ответ свидетельствует о блокировке, сообщает о блокировке.
+type PiHoleQueryPlugin struct {
+	piholeAddr string
 }
 
-// HandleQuery возвращает true, если домен должен быть заблокирован.
-func (p *PiHolePlugin) HandleQuery(domain string, qtype uint16) (bool, net.IP) {
-	// Простая проверка: если домен точно совпадает или заканчивается на заблокированное значение.
-	for _, blocked := range p.blockedDomains {
-		if domain == blocked || (len(domain) > len(blocked) && domain[len(domain)-len(blocked):] == blocked) {
-			log.Printf("Domain %s blocked by PiHolePlugin", domain)
-			return true, nil
+func (p *PiHoleQueryPlugin) HandleQuery(domain string, qtype uint16) (bool, net.IP) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), qtype)
+	client := new(dns.Client)
+	client.Timeout = 2 * time.Second
+	addr := p.piholeAddr
+	if addr == "" {
+		addr = "pihole:53"
+	}
+	r, _, err := client.Exchange(m, addr)
+	if err != nil {
+		log.Printf("PiHole query error for domain %s: %v", domain, err)
+		// При ошибке считаем домен заблокированным.
+		return true, nil
+	}
+	if r == nil || len(r.Answer) == 0 {
+		log.Printf("PiHole returned no answer for domain %s, blocking", domain)
+		return true, nil
+	}
+	// Если все записи указывают на блокирующий IP (0.0.0.0 или ::), считаем домен заблокированным.
+	blocked := true
+	for _, ans := range r.Answer {
+		switch rec := ans.(type) {
+		case *dns.A:
+			if rec.A.String() != "0.0.0.0" {
+				blocked = false
+			}
+		case *dns.AAAA:
+			if rec.AAAA.String() != "::" {
+				blocked = false
+			}
+		}
+	}
+	if blocked {
+		log.Printf("PiHole indicates domain %s is blocked", domain)
+		if qtype == dns.TypeAAAA {
+			return true, net.ParseIP("::")
+		}
+		return true, net.ParseIP("0.0.0.0")
+	}
+	// Если Pi-hole возвращает нормальный ответ, то считаем домен разрешённым.
+	return false, nil
+}
+
+// ------------------ Regex Proxy Plugin ------------------
+
+// RegexProxyPlugin проверяет домены по списку регулярных выражений и, если найдено совпадение, принудительно возвращает IP прокси.
+type RegexProxyPlugin struct {
+	Regexes []*regexp.Regexp
+}
+
+func (r *RegexProxyPlugin) HandleQuery(domain string, qtype uint16) (bool, net.IP) {
+	for _, re := range r.Regexes {
+		if re.MatchString(domain) {
+			log.Printf("Domain %s matches regex forcing proxy", domain)
+			if qtype == dns.TypeAAAA {
+				return true, net.ParseIP(proxyIPStrV6)
+			}
+			return true, net.ParseIP(proxyIPStr)
 		}
 	}
 	return false, nil
 }
 
-// Инициализация плагина с жестко заданным списком заблокированных доменов.
-var piHolePlugin = &PiHolePlugin{
-	blockedDomains: []string{"ads.example.com.", "tracker.example.com."},
-}
-
-// Список подключённых плагинов.
-var plugins = []DNSPlugin{piHolePlugin}
+// ------------------ Глобальные переменные и настройки ------------------
 
 // allowedDirectCountries – массив стран (код страны), для которых НЕ требуется проксирование.
-// Если код страны из ответа API содержится в этом массиве, то возвращаются реальные IP, иначе – возвращается IP прокси.
+// Если код страны из ответа API содержится в этом массиве, то возвращаются реальные IP, иначе – IP прокси.
 var allowedDirectCountries = []string{"RU", "BY", "CN"}
 
-// Для IPv4: excludeIPs – список IP-адресов, для которых всегда возвращаются реальные IP (например, IP самого прокси).
+// Для IPv4: excludeIPs – список IP, для которых всегда возвращаются реальные IP (например, IP самого прокси).
 var excludeIPs = []string{os.Getenv("PROXY_SERVER_ADDRESS")}
 
 // Для IPv6: excludeIPsV6 – список исключений для AAAA-запросов.
@@ -61,6 +112,16 @@ var proxyIPStr = os.Getenv("PROXY_SERVER_ADDRESS")
 
 // proxyIPStrV6 – IP-адрес прокси для IPv6.
 var proxyIPStrV6 = os.Getenv("PROXY_SERVER_ADDRESS_IPV6")
+
+// plugins – список плагинов, обрабатывающих запросы последовательно.
+// Сначала вызывается PiHoleQueryPlugin, затем RegexProxyPlugin.
+var plugins = []DNSPlugin{
+	&PiHoleQueryPlugin{piholeAddr: "pihole"},
+	&RegexProxyPlugin{Regexes: []*regexp.Regexp{
+		// Пример: все домены вида *.google.com.
+		regexp.MustCompile(`(?i)^(.+\.)?google\.com\.$`),
+	}},
+}
 
 // getCountryCodeFromAPI делает HTTP GET запрос к API геолокации и возвращает код страны.
 func getCountryCodeFromAPI(ip string) string {
@@ -93,12 +154,12 @@ func getCountryCodeFromAPI(ip string) string {
 	return data.Code
 }
 
-// lookupIPUsingDNS выполняет DNS-запрос к upstream серверу, указанному в UPSTREAM_DNS.
-// Если переменная не задана, по умолчанию используется 8.8.8.8:53.
+// lookupIPUsingDNS выполняет DNS-запрос к upstream-серверу, указанному в UPSTREAM_DNS.
+// Если переменная не задана, по умолчанию используется 1.1.1.1:53.
 func lookupIPUsingDNS(domain string, qtype uint16) ([]net.IP, error) {
 	upstream := os.Getenv("UPSTREAM_DNS")
 	if upstream == "" {
-		upstream = "8.8.8.8:53"
+		upstream = "1.1.1.1:53"
 	}
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(domain), qtype)
@@ -118,7 +179,7 @@ func lookupIPUsingDNS(domain string, qtype uint16) ([]net.IP, error) {
 		}
 	}
 	if len(ips) == 0 {
-		return nil, fmt.Errorf("no A/AAAA records found")
+		return nil, errors.New("no A/AAAA records found")
 	}
 	return ips, nil
 }
@@ -157,15 +218,11 @@ func processDNSQuery(req *dns.Msg) *dns.Msg {
 	question := req.Question[0]
 	domain := question.Name
 
-	// 1. Проверка через плагины (например, Pi-hole).
+	// 1. Выполняем обработку плагинами.
 	for _, plugin := range plugins {
 		blocked, pluginIP := plugin.HandleQuery(domain, question.Qtype)
 		if blocked {
-			blockIP := pluginIP
-			if blockIP == nil {
-				blockIP = net.ParseIP("0.0.0.0")
-			}
-			rr := createRR(domain, question.Qtype, 300, blockIP)
+			rr := createRR(domain, question.Qtype, 300, pluginIP)
 			resp.Answer = []dns.RR{rr}
 			return resp
 		}
@@ -178,7 +235,7 @@ func processDNSQuery(req *dns.Msg) *dns.Msg {
 		return resp
 	}
 
-	// 3. Фильтруем IP-адреса по типу (A или AAAA).
+	// 3. Фильтруем IP по типу (A или AAAA).
 	var relevantIPs []net.IP
 	switch question.Qtype {
 	case dns.TypeA:
@@ -200,13 +257,12 @@ func processDNSQuery(req *dns.Msg) *dns.Msg {
 			}
 		}
 	}
-
 	if len(relevantIPs) == 0 {
 		resp.Rcode = dns.RcodeNameError
 		return resp
 	}
 
-	// 4. Проверка исключений: если первый релевантный IP находится в списке исключений – возвращаем его.
+	// 4. Проверяем исключения: если первый релевантный IP находится в списке исключений, возвращаем его.
 	firstIPStr := relevantIPs[0].String()
 	if question.Qtype == dns.TypeA {
 		for _, exc := range excludeIPs {
@@ -437,7 +493,7 @@ func startDoTServer() {
 		return
 	}
 	tlsConfig.Certificates = []tls.Certificate{cert}
-	// Удалён вызов BuildNameToCertificate (deprecated).
+	// Deprecated метод BuildNameToCertificate не используется.
 	server := &dns.Server{
 		Addr:      ":853",
 		Net:       "tcp-tls",

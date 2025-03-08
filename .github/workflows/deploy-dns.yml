@@ -102,6 +102,7 @@ jobs:
           env PROXY_SERVER_ADDRESS=${{ secrets.PROXY_SERVER_ADDRESS }} \
           env PROXY_SERVER_ADDRESS_IPV6=${{ secrets.PROXY_SERVER_ADDRESS_IPV6 }} \
           env LOCATION_SERVER_ORIGIN=${{ secrets.LOCATION_SERVER_ORIGIN }} \
+          env UPSTREAM_DNS=${{ secrets.UPSTREAM_DNS }} \
             docker stack deploy --prune --with-registry-auth -c dns/compose.yaml dns-service
         env:
           DOCKER_HOST: ssh://${{ secrets.DNS_SERVER_SSH_USER }}@${{ secrets.DNS_SERVER_SSH_HOST }}
