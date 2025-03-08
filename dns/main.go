@@ -118,8 +118,8 @@ var proxyIPStrV6 = os.Getenv("PROXY_SERVER_ADDRESS_IPV6")
 var plugins = []DNSPlugin{
 	&PiHoleQueryPlugin{piholeAddr: "pihole"},
 	&RegexProxyPlugin{Regexes: []*regexp.Regexp{
-		// Пример: все домены вида *.google.com.
-		regexp.MustCompile(`(?i)^(.+\.)?google\.com\.$`),
+		regexp.MustCompile(`(?i)^(.+\.)?google\.com$`),
+		regexp.MustCompile(`(?i)^(.+\.)?youtube\.com$`),
 	}},
 }
 
