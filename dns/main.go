@@ -94,11 +94,11 @@ func getCountryCodeFromAPI(ip string) string {
 }
 
 // lookupIPUsingDNS выполняет DNS-запрос к upstream серверу, указанному в UPSTREAM_DNS.
-// Если переменная не задана, по умолчанию используется 1.1.1.1:53.
+// Если переменная не задана, по умолчанию используется 8.8.8.8:53.
 func lookupIPUsingDNS(domain string, qtype uint16) ([]net.IP, error) {
 	upstream := os.Getenv("UPSTREAM_DNS")
 	if upstream == "" {
-		upstream = "1.1.1.1:53"
+		upstream = "8.8.8.8:53"
 	}
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(domain), qtype)
