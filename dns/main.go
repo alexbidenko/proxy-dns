@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/miekg/dns"
@@ -45,15 +46,21 @@ var piHolePlugin = &PiHolePlugin{
 // Список подключённых плагинов.
 var plugins = []DNSPlugin{piHolePlugin}
 
-// allowedDirectCountries – массив стран (код страны), для которых не требуется проксирование.
-// Если код страны из ответа API содержится в этом массиве, то возвращаются реальные IP, иначе – прокси.
+// allowedDirectCountries – массив стран (код страны), для которых НЕ требуется проксирование.
+// Если код страны из ответа API содержится в этом массиве, то возвращаются реальные IP, иначе – возвращается IP прокси.
 var allowedDirectCountries = []string{"RU", "BY", "CN"}
 
-// excludeIPs – список IP-адресов, для которых всегда возвращаются реальные IP (например, IP самого прокси).
+// Для IPv4: excludeIPs – список IP-адресов, для которых всегда возвращаются реальные IP (например, IP самого прокси).
 var excludeIPs = []string{os.Getenv("PROXY_SERVER_ADDRESS")}
 
-// proxyIPStr – IP-адрес прокси, который возвращается, если страна не входит в allowedDirectCountries.
+// Для IPv6: excludeIPsV6 – список исключений для AAAA-запросов.
+var excludeIPsV6 = []string{os.Getenv("PROXY_SERVER_ADDRESS_IPV6")}
+
+// proxyIPStr – IP-адрес прокси для IPv4, который возвращается, если страна не входит в allowedDirectCountries.
 var proxyIPStr = os.Getenv("PROXY_SERVER_ADDRESS")
+
+// proxyIPStrV6 – IP-адрес прокси для IPv6.
+var proxyIPStrV6 = os.Getenv("PROXY_SERVER_ADDRESS_IPV6")
 
 // getCountryCodeFromAPI делает HTTP GET запрос к API геолокации и возвращает код страны.
 func getCountryCodeFromAPI(ip string) string {
@@ -86,6 +93,32 @@ func getCountryCodeFromAPI(ip string) string {
 	return data.Code
 }
 
+// DNSAnswer – структура для ответа в JSON формате DoH.
+type DNSAnswer struct {
+	Name string `json:"name"`
+	Type uint16 `json:"type"`
+	TTL  uint32 `json:"TTL"`
+	Data string `json:"data"`
+}
+
+// DNSQuestionJSON – упрощённая структура вопроса для JSON ответа.
+type DNSQuestionJSON struct {
+	Name string `json:"name"`
+	Type uint16 `json:"type"`
+}
+
+// DNSJSONResponse – структура ответа для JSON DoH.
+type DNSJSONResponse struct {
+	Status   int               `json:"Status"`
+	TC       bool              `json:"TC"`
+	RD       bool              `json:"RD"`
+	RA       bool              `json:"RA"`
+	AD       bool              `json:"AD"`
+	CD       bool              `json:"CD"`
+	Question []DNSQuestionJSON `json:"Question"`
+	Answer   []DNSAnswer       `json:"Answer,omitempty"`
+}
+
 // processDNSQuery обрабатывает DNS-запрос и формирует ответ.
 func processDNSQuery(req *dns.Msg) *dns.Msg {
 	resp := new(dns.Msg)
@@ -104,11 +137,8 @@ func processDNSQuery(req *dns.Msg) *dns.Msg {
 			if blockIP == nil {
 				blockIP = net.ParseIP("0.0.0.0")
 			}
-			a := &dns.A{
-				Hdr: dns.RR_Header{Name: domain, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
-				A:   blockIP,
-			}
-			resp.Answer = []dns.RR{a}
+			rr := createRR(domain, question.Qtype, 300, blockIP)
+			resp.Answer = []dns.RR{rr}
 			return resp
 		}
 	}
@@ -120,24 +150,62 @@ func processDNSQuery(req *dns.Msg) *dns.Msg {
 		return resp
 	}
 
-	// 3. Если первый IP находится в списке исключений, возвращаем его напрямую.
-	firstIPStr := ips[0].String()
-	for _, exc := range excludeIPs {
-		if firstIPStr == exc {
-			for _, ip := range ips {
-				if ip.To4() != nil {
-					a := &dns.A{
-						Hdr: dns.RR_Header{Name: domain, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
-						A:   ip,
-					}
-					resp.Answer = append(resp.Answer, a)
-				}
+	// 3. Фильтруем IP-адреса по типу (A или AAAA).
+	var relevantIPs []net.IP
+	switch question.Qtype {
+	case dns.TypeA:
+		for _, ip := range ips {
+			if ip.To4() != nil {
+				relevantIPs = append(relevantIPs, ip)
 			}
-			return resp
+		}
+	case dns.TypeAAAA:
+		for _, ip := range ips {
+			// Если ip не имеет представления в IPv4, то считаем его IPv6.
+			if ip.To4() == nil {
+				relevantIPs = append(relevantIPs, ip)
+			}
+		}
+	default:
+		// Для прочих типов можем попытаться вернуть A-записи.
+		for _, ip := range ips {
+			if ip.To4() != nil {
+				relevantIPs = append(relevantIPs, ip)
+			}
 		}
 	}
 
-	// 4. Получаем код страны через GeoIP API.
+	if len(relevantIPs) == 0 {
+		// Если для запрошенного типа ничего не найдено, возвращаем NXDOMAIN.
+		resp.Rcode = dns.RcodeNameError
+		return resp
+	}
+
+	// 4. Проверка исключений: если первый релевантный IP находится в списке исключений – возвращаем его.
+	firstIPStr := relevantIPs[0].String()
+	if question.Qtype == dns.TypeA {
+		for _, exc := range excludeIPs {
+			if firstIPStr == exc {
+				for _, ip := range relevantIPs {
+					rr := createRR(domain, dns.TypeA, 300, ip)
+					resp.Answer = append(resp.Answer, rr)
+				}
+				return resp
+			}
+		}
+	} else if question.Qtype == dns.TypeAAAA {
+		for _, exc := range excludeIPsV6 {
+			if firstIPStr == exc {
+				for _, ip := range relevantIPs {
+					rr := createRR(domain, dns.TypeAAAA, 300, ip)
+					resp.Answer = append(resp.Answer, rr)
+				}
+				return resp
+			}
+		}
+	}
+
+	// 5. Получаем код страны через GeoIP API для первого релевантного IP.
 	countryCode := getCountryCodeFromAPI(firstIPStr)
 	allowed := false
 	for _, c := range allowedDirectCountries {
@@ -147,30 +215,67 @@ func processDNSQuery(req *dns.Msg) *dns.Msg {
 		}
 	}
 
-	// 5. Если страна разрешена – возвращаем реальные IP, иначе – IP прокси.
+	// 6. Формируем ответ: если страна разрешена – возвращаем реальные IP, иначе – IP прокси.
 	if allowed {
-		for _, ip := range ips {
-			if ip.To4() != nil {
-				a := &dns.A{
-					Hdr: dns.RR_Header{Name: domain, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
-					A:   ip,
-				}
-				resp.Answer = append(resp.Answer, a)
-			}
+		for _, ip := range relevantIPs {
+			rr := createRR(domain, question.Qtype, 300, ip)
+			resp.Answer = append(resp.Answer, rr)
 		}
 	} else {
-		proxyIP := net.ParseIP(proxyIPStr)
-		a := &dns.A{
-			Hdr: dns.RR_Header{Name: domain, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
-			A:   proxyIP,
+		if question.Qtype == dns.TypeA {
+			proxyIP := net.ParseIP(proxyIPStr)
+			rr := createRR(domain, dns.TypeA, 60, proxyIP)
+			resp.Answer = []dns.RR{rr}
+		} else if question.Qtype == dns.TypeAAAA {
+			proxyIP := net.ParseIP(proxyIPStrV6)
+			// Если для IPv6 прокси не задан, можно вернуть NXDOMAIN или пустой ответ.
+			if proxyIP == nil {
+				resp.Rcode = dns.RcodeNameError
+			} else {
+				rr := createRR(domain, dns.TypeAAAA, 60, proxyIP)
+				resp.Answer = []dns.RR{rr}
+			}
+		} else {
+			// Для других типов – возвращаем NXDOMAIN.
+			resp.Rcode = dns.RcodeNameError
 		}
-		resp.Answer = []dns.RR{a}
 	}
+
 	return resp
 }
 
+// createRR создаёт ресурсную запись (A или AAAA) по типу.
+func createRR(domain string, qtype uint16, ttl uint32, ip net.IP) dns.RR {
+	switch qtype {
+	case dns.TypeA:
+		return &dns.A{
+			Hdr: dns.RR_Header{Name: domain, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl},
+			A:   ip.To4(),
+		}
+	case dns.TypeAAAA:
+		return &dns.AAAA{
+			Hdr:  dns.RR_Header{Name: domain, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttl},
+			AAAA: ip,
+		}
+	default:
+		// По умолчанию возвращаем A-запись.
+		return &dns.A{
+			Hdr: dns.RR_Header{Name: domain, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl},
+			A:   ip.To4(),
+		}
+	}
+}
+
 // dohHandler обрабатывает запросы DoH.
+// Поддерживаются два формата: бинарный (если передан параметр "dns") и JSON (если указан параметр "name" или accept = application/dns-json).
 func dohHandler(w http.ResponseWriter, r *http.Request) {
+	// Если есть параметр "name" или заголовок accept содержит "application/dns-json" – обрабатываем как JSON запрос.
+	if r.URL.Query().Get("name") != "" || strings.Contains(r.Header.Get("accept"), "application/dns-json") {
+		handleDohJSON(w, r)
+		return
+	}
+
+	// Иначе – бинарный режим (как ранее).
 	var reqData []byte
 	if r.Method == http.MethodGet {
 		dnsParam := r.URL.Query().Get("dns")
@@ -211,7 +316,77 @@ func dohHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(respData)
 }
 
-// startDoHServer запускает HTTP-сервер для DoH.
+// handleDohJSON обрабатывает DoH-запросы в формате JSON.
+func handleDohJSON(w http.ResponseWriter, r *http.Request) {
+	// Получаем параметры name и type.
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		http.Error(w, "Missing name parameter", http.StatusBadRequest)
+		return
+	}
+	typeStr := r.URL.Query().Get("type")
+	if typeStr == "" {
+		typeStr = "A"
+	}
+	// Определяем тип запроса. Используем map из пакета dns.
+	qtype, ok := dns.StringToType[strings.ToUpper(typeStr)]
+	if !ok {
+		http.Error(w, "Unsupported query type", http.StatusBadRequest)
+		return
+	}
+
+	// Формируем запрос.
+	reqMsg := new(dns.Msg)
+	reqMsg.SetQuestion(dns.Fqdn(name), qtype)
+	// Можно установить RD=true, если требуется рекурсивное разрешение.
+	reqMsg.RecursionDesired = true
+
+	// Обрабатываем запрос.
+	respMsg := processDNSQuery(reqMsg)
+
+	// Формируем JSON-ответ.
+	jsonResp := DNSJSONResponse{
+		Status: int(respMsg.Rcode),
+		TC:     respMsg.Truncated,
+		RD:     respMsg.RecursionDesired,
+		RA:     respMsg.RecursionAvailable,
+		AD:     respMsg.AuthenticatedData,
+		CD:     respMsg.CheckingDisabled,
+	}
+	// Вопросы.
+	for _, q := range respMsg.Question {
+		jsonResp.Question = append(jsonResp.Question, DNSQuestionJSON{
+			Name: q.Name,
+			Type: q.Qtype,
+		})
+	}
+	// Ответы.
+	for _, rr := range respMsg.Answer {
+		var data string
+		switch v := rr.(type) {
+		case *dns.A:
+			data = v.A.String()
+		case *dns.AAAA:
+			data = v.AAAA.String()
+		default:
+			data = rr.String()
+		}
+		jsonResp.Answer = append(jsonResp.Answer, DNSAnswer{
+			Name: rr.Header().Name,
+			Type: rr.Header().Rrtype,
+			TTL:  rr.Header().Ttl,
+			Data: data,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/dns-json")
+	enc := json.NewEncoder(w)
+	if err := enc.Encode(jsonResp); err != nil {
+		http.Error(w, "Failed to encode JSON", http.StatusInternalServerError)
+	}
+}
+
+// startDoHServer запускает HTTP-сервер для DoH на порту 443.
 func startDoHServer() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dns-query", dohHandler)
@@ -248,6 +423,8 @@ func startDoTServer() {
 		return
 	}
 	tlsConfig.Certificates = []tls.Certificate{cert}
+	// Дополнительно можно вызвать BuildNameToCertificate, если потребуется.
+	tlsConfig.BuildNameToCertificate()
 	server := &dns.Server{
 		Addr:      ":853",
 		Net:       "tcp-tls",
@@ -305,6 +482,6 @@ func main() {
 	startDoTServer()
 	startDoHServer()
 
-	// Блокировка main, чтобы сервис работал бесконечно.
+	// Блокируем main, чтобы сервис работал бесконечно.
 	select {}
 }

@@ -32,6 +32,7 @@ services:
       - "853:853/udp"
     environment:
       PROXY_SERVER_ADDRESS: ${PROXY_SERVER_ADDRESS}
+      PROXY_SERVER_ADDRESS_IPV6: ${PROXY_SERVER_ADDRESS_IPV6}
       LOCATION_SERVER_ORIGIN: ${LOCATION_SERVER_ORIGIN}
     volumes:
       - caddy-data:/data
