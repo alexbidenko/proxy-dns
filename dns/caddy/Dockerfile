@@ -1,6 +1,7 @@
 FROM caddy:2-alpine
 
-RUN adduser --system --uid 1001 caddy
+RUN addgroup -g 1001 -S caddy && \
+    adduser -u 1001 -G caddy -S -H -s /sbin/nologin caddy
 
 RUN mkdir -p /data/caddy && \
     mkdir -p /config && \
