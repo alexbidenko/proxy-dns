@@ -33,6 +33,8 @@ services:
     environment:
       PROXY_SERVER_ADDRESS: ${PROXY_SERVER_ADDRESS}
       LOCATION_SERVER_ORIGIN: ${LOCATION_SERVER_ORIGIN}
+    volumes:
+      - caddy-data:/data
     deploy:
       replicas: 1
       update_config:
