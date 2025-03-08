@@ -1,0 +1,7 @@
+{
+  email certs@gmail.com
+}
+
+dns.ab.tw1.su {
+  reverse_proxy application:443
+}

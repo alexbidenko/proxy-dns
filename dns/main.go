@@ -215,7 +215,7 @@ func dohHandler(w http.ResponseWriter, r *http.Request) {
 func startDoHServer() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dns-query", dohHandler)
-	addr := ":8053"
+	addr := ":443"
 	server := &http.Server{
 		Addr:    addr,
 		Handler: mux,
@@ -231,8 +231,8 @@ func startDoHServer() {
 // startDoTServer запускает сервер DNS over TLS (DoT) на порту 853.
 // Если сертификаты не найдены или возникла ошибка загрузки, сервер не запускается, но остальные сервисы работают.
 func startDoTServer() {
-	certFile := "cert.pem"
-	keyFile := "key.pem"
+	certFile := "/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/dns.ab.tw1.su/dns.ab.tw1.su.crt"
+	keyFile := "/data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/dns.ab.tw1.su/dns.ab.tw1.su.key"
 	if _, err := os.Stat(certFile); os.IsNotExist(err) {
 		log.Printf("DoT certificate %s not found, skipping DoT server", certFile)
 		return
